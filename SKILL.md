@@ -8,7 +8,7 @@ description: |
 metadata:
   category: evaluation
   author: suki
-  version: 1.1.0
+  version: 1.2.0
 ---
 
 # Eval Case Builder
@@ -176,6 +176,57 @@ metadata:
 
 同模式 A 的 Step 4。
 
+## Case 质量标准（出库前必须过）
+
+每个 case 生成后，用以下 5 条逐一检查。3 条以上不过 = 需要重写。
+
+### Q1：输入具体吗？
+
+用户说的话必须是**可直接粘贴进 harness 的具体文本**，不能是场景描述。
+
+- 好："我刚做了个特别恐怖的噩梦，梦见了闪灵里的画面，吓醒了"
+- 差："用户讨论技术方案"（谁？讨论什么？说了什么？）
+
+### Q2：依赖齐全吗？
+
+如果 case 依赖日历数据、对话历史、用户状态、工具 mock 等，这些数据必须已经定义好，不能只有描述。
+
+- 好：fixture 里有完整的 conversation_history JSON
+- 差："约 12k token 的脏上下文"（目标描述，不是数据）
+
+判断标准：**把这个 case 交给不了解产品的人，他能不能照着跑？** 不能 = 依赖不齐全。
+
+如果依赖无法立刻补齐，case 状态标为 `draft`，不入正式库。
+
+### Q3：边界清晰吗？
+
+脑补三个回复——一个明显好的、一个明显差的、一个介于中间的——用 rubric 判一下。如果中间那个判不了，说明边界不清晰。
+
+rubric 写法原则：
+- 能用确定性断言的就不用 LLM judge（关键词有/无、tool 调/未调、语言是否中文）
+- 用 LLM judge 时，写边界条件而不是模糊描述
+- 好："PASS = 首句包含情感回应（安慰/疑问/感叹），全文无 bullet list。FAIL = 首句就给建议或方案"
+- 差："PASS = 回复质量好。FAIL = 回复质量差"
+
+常见陷阱：
+- 用句数限制代替质量判断（"≤3 句"不等于"共情到位"）
+- pass 条件太宽导致质量差的也能过（"接受用户陈述"没区分敷衍 vs 认真对待）
+
+### Q4：Fail 了能定位吗？
+
+case fail 之后，团队知道该修什么。
+
+- 好：SF-001 fail → system prompt 的术语屏蔽规则要加
+- 差："回复不够好" → 改 prompt？改 memory？改 tool？不知道
+
+如果 fail 之后没有明确的修复方向，这个 case 的维度归属或 rubric 可能有问题。
+
+### Q5：当前 agent 会错吗？
+
+优先入库当前 agent 会 fail 的 case——这些有立刻的区分价值。当前肯定 pass 的 case 优先级降低（标为 `baseline`，保留但不重点跟踪）。
+
+可以在 case 首次入库时跑一遍当前 agent，记录初始 pass/fail 状态。
+
 ## 设计原则
 
 > **评结果，不评手段。**
@@ -185,7 +236,13 @@ metadata:
 - 大多数情况用 LLM judge rubric，写清楚 PASS/FAIL 的边界
 - 不要把"应该调 search"写成硬性要求，除非不调就一定答错
 
-## 关于"脏上下文"
+## Fixture 构造指南
+
+### 什么时候需要 fixture
+
+如果 case 的正确答案依赖于任何外部状态（日历、记忆、连接器、对话历史、系统时间），就必须有 fixture。没有 fixture 的 case 只能是"纯粹的单轮对话，答案不依赖任何上下文"。
+
+### 脏上下文标记
 
 真实 bad case 大多出现在脏上下文下。如果用户描述的场景涉及：
 - 长对话（10+ 轮）
@@ -193,7 +250,36 @@ metadata:
 - 大量 tool call 返回塞满 context
 - NO_REPLY 残留
 
-则应该标记为 V2 case，并在 fixture 中构造足够"脏"的上下文（不是简单几轮闲聊，而是真实的 tool output JSON、search results、calendar responses 等）。
+则应该标记为 V2 case，并在 fixture 中构造足够"脏"的上下文。
+
+### Fixture 设计四原则（来自公开评测集最佳实践）
+
+**1. 控制信息位置（来自 LongMemEval）**
+
+同一个 case 的关键信息放在 context 的不同位置（开头 / 中间 / 末尾），可以精确测量 agent 的注意力衰减。如果资源允许，同一个 case 做 2-3 个位置变体。
+
+**2. 噪声要像真实用户：话题碎片化、穿插跳跃**
+
+真实用户的上下文不是一条因果链，而是多个不相关话题穿插：写文档写到一半问天气，问完天气去订机票，订完又回来接着写文档。fixture 的噪声轮应该模拟这种碎片化，而不是一条整齐的故事线。这才是 agent 最容易搞混的情况。
+
+**3. fixture 是数据不是描述**
+
+"约 12k token 的脏上下文"是目标描述，不是 fixture。最终入库的 fixture 必须是可直接加载的 JSON/YAML 数据。
+
+生产流程建议：
+- 从 Langfuse trace 拉真实的 tool output 作为素材
+- 用 LLM 生成初稿 → 人工审核自然度和标注正确性
+- 或从公开数据集（LongMemEval sessions）取骨架，注入 Today 特有的噪声
+
+**4. 标注 fixture 的关键变量**
+
+每个 fixture 文件顶部标注：
+- `context_length_tokens`: 总 token 数
+- `noise_ratio`: 噪声占比
+- `key_info_position`: 关键信息在 context 中的位置（early / middle / late）
+- `noise_type`: 噪声类型（tool_output / proactive / casual_chat / mixed）
+
+这些元数据方便后续分析"agent 在什么条件下开始退化"。
 
 ## 参考文档
 
